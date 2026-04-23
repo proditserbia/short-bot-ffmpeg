@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Short Bot (FFmpeg + CUDA/NVENC) — minimal Tkinter GUI
+Short Bot (FFmpeg + CUDA/NVENC) v8 — Tkinter GUI
 
-Defaults (client):
-- Default speed (≤10 min): 4.0×
-- Recurse subfolders: ON
-- Use CUDA HWAccel decode: ON
-- Overwrite outputs: ON
+Preserved from v7 (UNCHANGED):
+- Speed rule: ≤10 min → base_speed; >10 min → 5×
+- No-skip guarantee (fallback ladder 4→3→2 etc.)
+- All encoding defaults and parameters
 
-Speed rule based on video length:
-- Videos ≤ 10 minutes → use default speed (UI, default 4×)
-- Videos > 10 minutes → automatically switch to 5×
-
-IMPORTANT behavior change (client testing request):
-- NEVER skip a source video just because it becomes too short after speed-up.
-- If effective duration after speed-up is too short to reach MIN_EFFECTIVE_DURATION:
-    try lower speeds: 4× -> 3× -> 2× (or 5× -> 4× -> 3× -> 2×)
-  If still too short even at 2×:
-    keep the clip as-is (use best/lowest speed attempted) and render anyway.
-- Also, do NOT post-skip outputs that are shorter than MIN_EFFECTIVE_DURATION.
-  We keep them (especially for truly short source clips).
-
-Everything else stays the same (output duration, encoder, etc.).
+New in v8:
+- Random Duration Toggle (20–30 s random target per file)
+- Minimum Duration Toggle (controls no-skip fallback ladder)
+- Loop Mode (continuous folder processing until manually stopped)
+- Include / Exclude Folders (per-subfolder selection dialog)
+- Workflow Mode: Normal (long videos) vs Short Clips (10–60 s, no forced trim)
+- Pause / Resume button (waits between files, never corrupts current job)
+- Improved H265/HEVC and mixed-format handling (auto software-decode)
+- Config persistence (JSON file next to the script)
+- Fixed use_hwaccel wiring (was hardcoded False in v7)
+- FFmpeg/FFprobe also searched in tools/ subdirectory
 """
 
 from __future__ import annotations
@@ -32,6 +28,7 @@ import sys
 import json
 import time
 import queue
+import random
 import signal
 import threading
 import subprocess
@@ -48,13 +45,27 @@ VIDEO_EXTS = {
     ".mpg", ".mpeg", ".ts", ".m2ts", ".mts"
 }
 
-# --- Client speed rule ---
+# --- Client speed rule (PRESERVED FROM v7) ---
 LENGTH_THRESHOLD_SEC = 10 * 60  # 10 minutes
-SPEED_LONG = 5.0                # > 10 min
+SPEED_LONG = 5.0                 # > 10 min
 DEFAULT_SPEED_SHORT = 4.0        # <= 10 min (UI default)
 
 # Skip logic threshold (kept for logging / decisions, BUT WE DO NOT SKIP ANYMORE)
 MIN_EFFECTIVE_DURATION = 50.0  # seconds (after speed-up) — used only to decide fallback speeds
+
+# Random duration range (v8)
+RANDOM_DURATION_MIN = 20.0
+RANDOM_DURATION_MAX = 30.0
+
+# Codecs that benefit from software decode (skip hwaccel for these)
+HEVC_LIKE_CODECS = {"hevc", "h265", "vp9", "av1", "vc1"}
+
+# Config persistence file (sits next to the script)
+CONFIG_FILE = Path(__file__).with_suffix(".json")
+
+# Loop mode: wait periods between scans (in 0.1-second increments for stop responsiveness)
+LOOP_RESCAN_WAIT_SEC = 5    # wait between loop iterations
+LOOP_EMPTY_WAIT_SEC = 10    # wait when no new files are found (overwrite=OFF)
 
 
 def _subprocess_no_window_kwargs() -> dict:
@@ -78,10 +89,16 @@ class JobConfig:
     bufsize: str = "50M"
     audio_bitrate: str = "160k"
     out_fps: Optional[int] = None        # e.g. 30; None keeps source cadence
-    overwrite: bool = True              # DEFAULT ON (client)
-    use_hwaccel: bool = True            # DEFAULT ON (client)
-    recurse: bool = True                # DEFAULT ON (client)
+    overwrite: bool = True               # DEFAULT ON (client)
+    use_hwaccel: bool = True             # DEFAULT ON (client)
+    recurse: bool = True                 # DEFAULT ON (client)
     dry_run: bool = False
+    # v8 additions
+    random_duration: bool = False        # use random 20–30 s target per file
+    use_min_duration: bool = True        # apply MIN_EFFECTIVE_DURATION ladder
+    workflow_mode: str = "normal"        # "normal" | "short_clips"
+    loop_mode: bool = False              # continuously re-process folders
+    include_folders: Optional[List[str]] = None  # None = all subfolders
 
 
 def which_ffmpeg() -> str:
@@ -89,6 +106,9 @@ def which_ffmpeg() -> str:
     local = Path(__file__).with_name(exe)
     if local.exists():
         return str(local)
+    tools_local = Path(__file__).parent / "tools" / exe
+    if tools_local.exists():
+        return str(tools_local)
     return exe
 
 
@@ -97,6 +117,9 @@ def which_ffprobe() -> str:
     local = Path(__file__).with_name(exe)
     if local.exists():
         return str(local)
+    tools_local = Path(__file__).parent / "tools" / exe
+    if tools_local.exists():
+        return str(tools_local)
     return exe
 
 
@@ -104,13 +127,45 @@ def is_video_file(p: Path) -> bool:
     return p.is_file() and p.suffix.lower() in VIDEO_EXTS
 
 
-def list_videos(root: Path, recurse: bool) -> List[Path]:
+def list_videos(
+    root: Path,
+    recurse: bool,
+    include_folders: Optional[List[str]] = None,
+) -> List[Path]:
+    """
+    List video files under root.
+    include_folders: if set, only recurse into those immediate subfolders of root.
+                     Files directly in root are included regardless.
+    """
+    inc: Optional[set] = set(include_folders) if include_folders is not None else None
+
     if recurse:
-        files = [p for p in root.rglob("*") if is_video_file(p)]
+        files: List[Path] = []
+        for p in root.rglob("*"):
+            if not is_video_file(p):
+                continue
+            rel_parts = p.relative_to(root).parts
+            if len(rel_parts) > 1 and inc is not None:
+                # File is inside a subfolder — check if that top-level folder is selected
+                if rel_parts[0] not in inc:
+                    continue
+            files.append(p)
     else:
         files = [p for p in root.iterdir() if is_video_file(p)]
+
     files.sort(key=lambda x: x.name.lower())
     return files
+
+
+def get_immediate_subfolders(root: Path) -> List[str]:
+    """Return sorted list of immediate subfolder names (excluding _-prefixed dirs)."""
+    try:
+        return sorted(
+            d.name for d in root.iterdir()
+            if d.is_dir() and not d.name.startswith("_")
+        )
+    except Exception:
+        return []
 
 
 def safe_out_name(src: Path) -> str:
@@ -136,6 +191,28 @@ def probe_duration_seconds(path: Path) -> Optional[float]:
         if not out:
             return None
         return float(out)
+    except Exception:
+        return None
+
+
+def probe_video_codec(path: Path) -> Optional[str]:
+    """Returns the primary video codec name (e.g. 'h264', 'hevc') or None."""
+    try:
+        cmd = [
+            which_ffprobe(),
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name",
+            "-of", "default=nw=1:nk=1",
+            str(path),
+        ]
+        out = subprocess.check_output(
+            cmd,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            **_subprocess_no_window_kwargs()
+        ).strip()
+        return out.lower() if out else None
     except Exception:
         return None
 
@@ -170,16 +247,26 @@ def candidate_speeds_for(initial_speed: float) -> List[float]:
     return out
 
 
-def pick_speed_no_skip(src_duration_sec: float, initial_speed: float) -> Tuple[float, List[Tuple[float, float]]]:
+def pick_speed_no_skip(
+    src_duration_sec: float,
+    initial_speed: float,
+    use_min_duration: bool = True,
+) -> Tuple[float, List[Tuple[float, float]]]:
     """
-    Decide speed with fallback:
-    Try candidate speeds until effective_duration >= MIN_EFFECTIVE_DURATION.
-    If none qualify, return the LAST speed in ladder (lowest / slowest) anyway.
-    Returns (chosen_speed, trials) where trials are [(speed, effective_duration_sec), ...]
+    Decide speed with fallback ladder (PRESERVED FROM v7).
+    If use_min_duration=False (short-clips mode), returns initial_speed immediately
+    without attempting the fallback ladder.
+    Returns (chosen_speed, trials) where trials = [(speed, effective_duration_sec), ...]
     """
     trials: List[Tuple[float, float]] = []
-    ladder = candidate_speeds_for(initial_speed)
 
+    if not use_min_duration:
+        # Short-clips mode: use the chosen initial speed directly, no fallback
+        eff = src_duration_sec / initial_speed if initial_speed > 0 else 0.0
+        trials.append((initial_speed, eff))
+        return initial_speed, trials
+
+    ladder = candidate_speeds_for(initial_speed)
     chosen = ladder[-1]
     for s in ladder:
         eff = src_duration_sec / s if s > 0 else 0.0
@@ -190,12 +277,24 @@ def pick_speed_no_skip(src_duration_sec: float, initial_speed: float) -> Tuple[f
     return chosen, trials
 
 
-def build_ffmpeg_cmd(cfg: JobConfig, src: Path, dst_tmp: Path, speed: float) -> List[str]:
+def build_ffmpeg_cmd(
+    cfg: JobConfig,
+    src: Path,
+    dst_tmp: Path,
+    speed: float,
+    src_codec: Optional[str] = None,
+) -> List[str]:
     """
+    Build the FFmpeg command.
+
+    v8 changes:
+    - src_codec: if HEVC/problematic, hwaccel is skipped automatically.
+    - workflow_mode=="short_clips": the -t (duration trim) flag is omitted.
+
     FFmpeg graph:
       video: setpts=PTS/speed
       audio: atempo chain to support >2.0 speed (0.5..2.0 each)
-    Cut: -t cfg.out_duration (after speed-up).
+    Cut: -t cfg.out_duration (after speed-up) — skipped in short_clips mode.
     """
     ffmpeg = which_ffmpeg()
 
@@ -216,6 +315,12 @@ def build_ffmpeg_cmd(cfg: JobConfig, src: Path, dst_tmp: Path, speed: float) -> 
     if cfg.out_fps:
         v_filter = f"{v_filter},fps={int(cfg.out_fps)}"
 
+    # HEVC/problematic codecs: skip hwaccel to avoid decode failures.
+    # If src_codec is None (probe failed), honour the user's hwaccel setting.
+    use_hw = cfg.use_hwaccel and (
+        src_codec is None or src_codec not in HEVC_LIKE_CODECS
+    )
+
     cmd = [
         ffmpeg,
         "-hide_banner",
@@ -223,12 +328,16 @@ def build_ffmpeg_cmd(cfg: JobConfig, src: Path, dst_tmp: Path, speed: float) -> 
         "-y" if cfg.overwrite else "-n",
     ]
 
-    if cfg.use_hwaccel:
+    if use_hw:
         cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
 
+    cmd += ["-i", str(src)]
+
+    # Short-clips mode: no forced duration trim
+    if cfg.workflow_mode != "short_clips":
+        cmd += ["-t", f"{cfg.out_duration:.3f}"]
+
     cmd += [
-        "-i", str(src),
-        "-t", f"{cfg.out_duration:.3f}",
         "-map", "0:v:0?",
         "-map", "0:a:0?",
         "-vf", v_filter,
@@ -364,6 +473,107 @@ def run_ffmpeg_with_progress(cmd: List[str], stop_event: threading.Event) -> Tup
             pass
 
 
+# ─── Config persistence ────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    """Load saved GUI settings from JSON file next to the script."""
+    try:
+        if CONFIG_FILE.exists():
+            with CONFIG_FILE.open("r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def save_config(data: dict) -> None:
+    """Persist GUI settings to JSON file."""
+    try:
+        with CONFIG_FILE.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+# ─── Folder Selection Dialog ───────────────────────────────────────────────────
+
+class FolderSelectDialog(tk.Toplevel):
+    """
+    Modal dialog listing all immediate subfolders of input_dir as checkboxes.
+    result is a list of selected folder names, or None if cancelled.
+    """
+
+    def __init__(
+        self,
+        parent: tk.Tk,
+        root_dir: Path,
+        current_selection: Optional[List[str]],
+    ):
+        super().__init__(parent)
+        self.title("Select Folders to Process")
+        self.resizable(True, True)
+        self.grab_set()
+        self.result: Optional[List[str]] = None
+
+        subfolders = get_immediate_subfolders(root_dir)
+        if not subfolders:
+            tk.Label(
+                self,
+                text="No subfolders found. Root-level files will be processed.",
+                padx=20, pady=14,
+            ).pack()
+            ttk.Button(self, text="Close", command=self.destroy).pack(pady=6)
+            return
+
+        tk.Label(
+            self,
+            text="Check the folders you want to process (uncheck to skip):",
+            padx=10, pady=6,
+        ).pack(anchor="w")
+
+        # Scrollable checkbox list
+        container = ttk.Frame(self)
+        container.pack(fill="both", expand=True, padx=10)
+
+        canvas = tk.Canvas(container, width=420, height=300)
+        sb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        sel_set = set(current_selection) if current_selection is not None else set(subfolders)
+        self._vars: dict = {}
+        for name in subfolders:
+            var = tk.BooleanVar(value=(name in sel_set))
+            self._vars[name] = var
+            ttk.Checkbutton(inner, text=name, variable=var).pack(anchor="w", padx=4, pady=1)
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(fill="x", padx=10, pady=8)
+        ttk.Button(btn_frame, text="Select All", command=self._select_all).pack(side="left")
+        ttk.Button(btn_frame, text="Deselect All", command=self._deselect_all).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="OK", command=self._ok).pack(side="right")
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side="right", padx=4)
+
+    def _select_all(self):
+        for v in self._vars.values():
+            v.set(True)
+
+    def _deselect_all(self):
+        for v in self._vars.values():
+            v.set(False)
+
+    def _ok(self):
+        self.result = [name for name, var in self._vars.items() if var.get()]
+        self.destroy()
+
+
 class ShortBotApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -377,52 +587,111 @@ class ShortBotApp(tk.Tk):
         except Exception:
             pass
 
-        self.title("Short Bot — FFmpeg + CUDA (NVENC)")
-        self.geometry("860x520")
+        self.title("Short Bot v8 — FFmpeg + CUDA (NVENC)")
+        self.geometry("920x720")
 
         self.msg_q: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self.worker_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
+        self.pause_event = threading.Event()
+        self.pause_event.set()  # set = running; clear = paused
+        self._is_paused = False
 
-        self.input_dir = tk.StringVar()
-        self.output_dir = tk.StringVar()
+        # Load persisted settings
+        saved = load_config()
+
+        self.input_dir = tk.StringVar(value=saved.get("input_dir", ""))
+        self.output_dir = tk.StringVar(value=saved.get("output_dir", ""))
 
         # UI speed is "default speed for ≤10m" (client default 4.0)
-        self.base_speed = tk.DoubleVar(value=DEFAULT_SPEED_SHORT)
+        self.base_speed = tk.DoubleVar(value=saved.get("base_speed", DEFAULT_SPEED_SHORT))
 
-        self.duration = tk.DoubleVar(value=60.0)
-        self.encoder = tk.StringVar(value="h264_nvenc")
-        self.preset = tk.StringVar(value="p5")
-        self.cq = tk.IntVar(value=23)
-        self.out_fps = tk.StringVar(value="")  # optional
+        self.duration = tk.DoubleVar(value=saved.get("duration", 60.0))
+        self.encoder = tk.StringVar(value=saved.get("encoder", "h264_nvenc"))
+        self.preset = tk.StringVar(value=saved.get("preset", "p5"))
+        self.cq = tk.IntVar(value=saved.get("cq", 23))
+        self.out_fps = tk.StringVar(value=saved.get("out_fps", ""))  # optional
 
         # DEFAULTS per client request:
-        self.recurse = tk.BooleanVar(value=True)
-        self.hwaccel = tk.BooleanVar(value=True)
-        self.overwrite = tk.BooleanVar(value=True)
+        self.recurse = tk.BooleanVar(value=saved.get("recurse", True))
+        self.hwaccel = tk.BooleanVar(value=saved.get("hwaccel", True))
+        self.overwrite = tk.BooleanVar(value=saved.get("overwrite", True))
+
+        # v8 additions
+        self.random_duration = tk.BooleanVar(value=saved.get("random_duration", False))
+        self.use_min_duration = tk.BooleanVar(value=saved.get("use_min_duration", True))
+        self.workflow_mode = tk.StringVar(value=saved.get("workflow_mode", "normal"))
+        self.loop_mode = tk.BooleanVar(value=saved.get("loop_mode", False))
+
+        # Include folder filter: list of subfolder names, or None = process all
+        self._include_folders: Optional[List[str]] = saved.get("include_folders", None)
 
         self.total_files = 0
         self.done_files = 0
 
         self._build_ui()
+        self._apply_workflow_mode()  # set initial widget enable/disable states
         self._tick()
 
-    def _build_ui(self):
-        pad = {"padx": 10, "pady": 6}
+    def _save_config(self):
+        save_config({
+            "input_dir": self.input_dir.get(),
+            "output_dir": self.output_dir.get(),
+            "base_speed": self.base_speed.get(),
+            "duration": self.duration.get(),
+            "encoder": self.encoder.get(),
+            "preset": self.preset.get(),
+            "cq": self.cq.get(),
+            "out_fps": self.out_fps.get(),
+            "recurse": self.recurse.get(),
+            "hwaccel": self.hwaccel.get(),
+            "overwrite": self.overwrite.get(),
+            "random_duration": self.random_duration.get(),
+            "use_min_duration": self.use_min_duration.get(),
+            "workflow_mode": self.workflow_mode.get(),
+            "loop_mode": self.loop_mode.get(),
+            "include_folders": self._include_folders,
+        })
 
+    def _build_ui(self):
+        pad = {"padx": 10, "pady": 4}
+
+        # ── Folder selection ──────────────────────────────────────────────────
         top = ttk.Frame(self)
         top.pack(fill="x", **pad)
 
         ttk.Label(top, text="Input folder:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.input_dir, width=70).grid(row=0, column=1, sticky="we", padx=8)
-        ttk.Button(top, text="Browse...", command=self._browse_input).grid(row=0, column=2)
+        ttk.Entry(top, textvariable=self.input_dir, width=62).grid(row=0, column=1, sticky="we", padx=6)
+        ttk.Button(top, text="Browse…", command=self._browse_input).grid(row=0, column=2)
+        ttk.Button(top, text="Select Folders…", command=self._open_folder_select).grid(row=0, column=3, padx=4)
 
         ttk.Label(top, text="Output folder:").grid(row=1, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.output_dir, width=70).grid(row=1, column=1, sticky="we", padx=8)
-        ttk.Button(top, text="Browse...", command=self._browse_output).grid(row=1, column=2)
+        ttk.Entry(top, textvariable=self.output_dir, width=62).grid(row=1, column=1, sticky="we", padx=6)
+        ttk.Button(top, text="Browse…", command=self._browse_output).grid(row=1, column=2)
 
         top.columnconfigure(1, weight=1)
 
+        # ── Workflow Mode ─────────────────────────────────────────────────────
+        wf_frame = ttk.LabelFrame(self, text="Workflow Mode")
+        wf_frame.pack(fill="x", **pad)
+
+        self._rb_normal = ttk.Radiobutton(
+            wf_frame,
+            text="Normal  — speed-up + trim to target duration  (for long source videos)",
+            variable=self.workflow_mode, value="normal",
+            command=self._apply_workflow_mode,
+        )
+        self._rb_normal.grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=2)
+
+        self._rb_short = ttk.Radiobutton(
+            wf_frame,
+            text="Short Clips  — speed only, no forced trim  (for 10–60 s source clips)",
+            variable=self.workflow_mode, value="short_clips",
+            command=self._apply_workflow_mode,
+        )
+        self._rb_short.grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=2)
+
+        # ── Encoding settings ─────────────────────────────────────────────────
         opts = ttk.LabelFrame(self, text="Settings")
         opts.pack(fill="x", **pad)
 
@@ -431,8 +700,9 @@ class ShortBotApp(tk.Tk):
             .grid(row=0, column=1, sticky="w", padx=6)
 
         ttk.Label(opts, text="Output duration (s):").grid(row=0, column=2, sticky="w")
-        ttk.Spinbox(opts, from_=5.0, to=90.0, increment=1.0, textvariable=self.duration, width=8)\
-            .grid(row=0, column=3, sticky="w", padx=6)
+        self._spin_duration = ttk.Spinbox(
+            opts, from_=5.0, to=90.0, increment=1.0, textvariable=self.duration, width=8)
+        self._spin_duration.grid(row=0, column=3, sticky="w", padx=6)
 
         ttk.Label(opts, text="Encoder:").grid(row=0, column=4, sticky="w")
         ttk.Combobox(opts, textvariable=self.encoder, values=["h264_nvenc", "hevc_nvenc"], width=12, state="readonly")\
@@ -456,22 +726,51 @@ class ShortBotApp(tk.Tk):
         ttk.Checkbutton(opts, text="Overwrite outputs", variable=self.overwrite)\
             .grid(row=2, column=4, columnspan=2, sticky="w", padx=2)
 
-        note = ttk.Label(
+        ttk.Label(
             opts,
             text=(
-                f"Rule: if video > 10 minutes, speed auto-switches to {SPEED_LONG:.1f}×.\n"
+                f"Rule: if video > 10 min, speed auto-switches to {SPEED_LONG:.1f}×.\n"
                 f"No-skip: if clip is too short after speed-up, bot tries lower speeds (…→3×→2×) and still renders."
-            )
-        )
-        note.grid(row=3, column=0, columnspan=6, sticky="w", padx=2, pady=(6, 0))
+            ),
+        ).grid(row=3, column=0, columnspan=6, sticky="w", padx=2, pady=(4, 0))
 
+        # ── Processing Options ────────────────────────────────────────────────
+        po = ttk.LabelFrame(self, text="Processing Options")
+        po.pack(fill="x", **pad)
+
+        self._cb_random_dur = ttk.Checkbutton(
+            po,
+            text="Random output duration (20–30 s per file)",
+            variable=self.random_duration,
+            command=self._apply_workflow_mode,
+        )
+        self._cb_random_dur.grid(row=0, column=0, sticky="w", padx=8, pady=2)
+
+        self._cb_min_dur = ttk.Checkbutton(
+            po,
+            text="Use minimum duration rule (speed fallback ladder)",
+            variable=self.use_min_duration,
+        )
+        self._cb_min_dur.grid(row=0, column=1, sticky="w", padx=16, pady=2)
+
+        ttk.Checkbutton(
+            po, text="Loop mode (re-scan and process continuously)", variable=self.loop_mode,
+        ).grid(row=1, column=0, sticky="w", padx=8, pady=2)
+
+        self._lbl_folders = ttk.Label(po, text="", foreground="gray")
+        self._lbl_folders.grid(row=1, column=1, sticky="w", padx=16)
+        self._update_folder_label()
+
+        # ── Controls ──────────────────────────────────────────────────────────
         ctrl = ttk.Frame(self)
         ctrl.pack(fill="x", **pad)
 
-        self.btn_start = ttk.Button(ctrl, text="Start", command=self._start)
-        self.btn_stop = ttk.Button(ctrl, text="Stop", command=self._stop, state="disabled")
+        self.btn_start = ttk.Button(ctrl, text="▶  Start", command=self._start)
+        self.btn_stop = ttk.Button(ctrl, text="■  Stop", command=self._stop, state="disabled")
+        self.btn_pause = ttk.Button(ctrl, text="⏸  Pause", command=self._toggle_pause, state="disabled")
         self.btn_start.pack(side="left")
-        self.btn_stop.pack(side="left", padx=8)
+        self.btn_stop.pack(side="left", padx=4)
+        self.btn_pause.pack(side="left")
 
         self.prog = ttk.Progressbar(ctrl, orient="horizontal", mode="determinate")
         self.prog.pack(side="left", fill="x", expand=True, padx=10)
@@ -479,23 +778,76 @@ class ShortBotApp(tk.Tk):
         self.lbl = ttk.Label(ctrl, text="Idle")
         self.lbl.pack(side="right")
 
+        # ── Log ───────────────────────────────────────────────────────────────
         logf = ttk.LabelFrame(self, text="Log")
         logf.pack(fill="both", expand=True, **pad)
 
-        self.log = tk.Text(logf, height=14, wrap="word")
-        self.log.pack(fill="both", expand=True, padx=8, pady=8)
+        self.log = tk.Text(logf, height=12, wrap="word")
+        sb_log = ttk.Scrollbar(logf, orient="vertical", command=self.log.yview)
+        self.log.configure(yscrollcommand=sb_log.set)
+        self.log.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+        sb_log.pack(side="right", fill="y", pady=8, padx=(0, 8))
+
+    def _apply_workflow_mode(self):
+        """Enable/disable widgets based on the current workflow mode and toggles."""
+        mode = self.workflow_mode.get()
+        if mode == "short_clips":
+            # Short-clips forces random_duration and use_min_duration OFF
+            self.random_duration.set(False)
+            self.use_min_duration.set(False)
+            self._cb_random_dur.config(state="disabled")
+            self._cb_min_dur.config(state="disabled")
+            self._spin_duration.config(state="disabled")
+        else:
+            self._cb_random_dur.config(state="normal")
+            self._cb_min_dur.config(state="normal")
+            # Duration spinbox is irrelevant when random_duration is on
+            if self.random_duration.get():
+                self._spin_duration.config(state="disabled")
+            else:
+                self._spin_duration.config(state="normal")
+
+    def _update_folder_label(self):
+        if self._include_folders is None:
+            self._lbl_folders.config(text="Folders: all subfolders", foreground="gray")
+        else:
+            n = len(self._include_folders)
+            if n == 0:
+                self._lbl_folders.config(text="Folders: none selected — root files only", foreground="orange")
+            else:
+                self._lbl_folders.config(text=f"Folders: {n} selected", foreground="black")
 
     def _browse_input(self):
         d = filedialog.askdirectory(title="Select input folder")
         if d:
             self.input_dir.set(d)
-            out = Path(d) / "_SHORTS_OUT"
-            self.output_dir.set(str(out))
+            # Auto-suggest output folder on first selection
+            if not self.output_dir.get():
+                self.output_dir.set(str(Path(d) / "_SHORTS_OUT"))
+            # Reset folder filter when input changes
+            self._include_folders = None
+            self._update_folder_label()
 
     def _browse_output(self):
         d = filedialog.askdirectory(title="Select output folder")
         if d:
             self.output_dir.set(d)
+
+    def _open_folder_select(self):
+        in_dir = Path(self.input_dir.get().strip() or "")
+        if not in_dir.exists() or not in_dir.is_dir():
+            messagebox.showerror("Error", "Please select a valid input folder first.")
+            return
+        dlg = FolderSelectDialog(self, in_dir, self._include_folders)
+        self.wait_window(dlg)
+        if dlg.result is not None:
+            # If the user selected every subfolder, treat as "process all"
+            all_subs = set(get_immediate_subfolders(in_dir))
+            if all_subs and set(dlg.result) == all_subs:
+                self._include_folders = None
+            else:
+                self._include_folders = dlg.result
+            self._update_folder_label()
 
     def _append_log(self, s: str):
         self.log.insert("end", s + "\n")
@@ -504,20 +856,33 @@ class ShortBotApp(tk.Tk):
     def _set_status(self, s: str):
         self.lbl.config(text=s)
 
+    def _toggle_pause(self):
+        if self._is_paused:
+            self._is_paused = False
+            self.pause_event.set()
+            self.btn_pause.config(text="⏸  Pause")
+            self._append_log("Resumed.")
+        else:
+            self._is_paused = True
+            self.pause_event.clear()
+            self.btn_pause.config(text="▶  Resume")
+            self._append_log("Paused — will finish current file, then wait…")
+
     def _start(self):
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showwarning("Running", "Already running.")
             return
 
         in_dir = Path(self.input_dir.get().strip() or "")
-        out_dir = Path(self.output_dir.get().strip() or "")
+        out_dir_str = self.output_dir.get().strip()
+        out_dir = Path(out_dir_str) if out_dir_str else Path("")
 
         if not in_dir.exists() or not in_dir.is_dir():
             messagebox.showerror("Error", "Please select a valid input folder.")
             return
 
-        if not out_dir:
-            messagebox.showerror("Error", "Please select a valid output folder.")
+        if not out_dir_str:
+            messagebox.showerror("Error", "Please specify an output folder.")
             return
 
         try:
@@ -527,12 +892,21 @@ class ShortBotApp(tk.Tk):
             return
 
         fps_txt = self.out_fps.get().strip()
-        fps_val = int(fps_txt) if fps_txt else None
+        try:
+            fps_val = int(fps_txt) if fps_txt else None
+        except ValueError:
+            messagebox.showerror("Error", "Force FPS must be an integer or blank.")
+            return
 
         base_speed = float(self.base_speed.get())
         if base_speed <= 0:
-            messagebox.showerror("Error", "Speed must be > 0")
+            messagebox.showerror("Error", "Speed must be > 0.")
             return
+
+        mode = self.workflow_mode.get()
+        # Short-clips mode forces these off regardless of checkbox state
+        use_rand_dur = self.random_duration.get() and mode == "normal"
+        use_min_dur = self.use_min_duration.get() and mode != "short_clips"
 
         cfg = JobConfig(
             input_dir=in_dir,
@@ -543,13 +917,22 @@ class ShortBotApp(tk.Tk):
             cq=int(self.cq.get()),
             out_fps=fps_val,
             recurse=bool(self.recurse.get()),
-            use_hwaccel=False,
+            use_hwaccel=bool(self.hwaccel.get()),
             overwrite=bool(self.overwrite.get()),
+            random_duration=use_rand_dur,
+            use_min_duration=use_min_dur,
+            workflow_mode=mode,
+            loop_mode=bool(self.loop_mode.get()),
+            include_folders=self._include_folders,
         )
 
         self.stop_event.clear()
+        self.pause_event.set()
+        self._is_paused = False
+
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
+        self.btn_pause.config(state="normal", text="⏸  Pause")
         self.prog["value"] = 0
 
         self._append_log(f"FFmpeg:  {which_ffmpeg()}")
@@ -557,167 +940,261 @@ class ShortBotApp(tk.Tk):
         self._append_log(f"Input:   {cfg.input_dir}")
         self._append_log(f"Output:  {cfg.output_dir}")
         self._append_log(
-            f"Defaults: speed(≤10m)={base_speed:.1f}x, speed(>10m)={SPEED_LONG:.1f}x, "
-            f"duration={cfg.out_duration}s, enc={cfg.encoder}, preset={cfg.preset}, cq={cfg.cq}, "
-            f"fps={cfg.out_fps or 'auto'}, recurse={cfg.recurse}, hwaccel={cfg.use_hwaccel}, overwrite={cfg.overwrite}"
+            f"Mode: {cfg.workflow_mode}  speed(≤10m)={base_speed:.1f}×  speed(>10m)={SPEED_LONG:.1f}×  "
+            f"duration={cfg.out_duration}s  rand_dur={cfg.random_duration}  "
+            f"min_dur={cfg.use_min_duration}  loop={cfg.loop_mode}  "
+            f"hwaccel={cfg.use_hwaccel}  overwrite={cfg.overwrite}"
         )
         self._append_log("----")
+
+        self._save_config()
 
         self.worker_thread = threading.Thread(target=self._worker, args=(cfg, base_speed), daemon=True)
         self.worker_thread.start()
 
     def _stop(self):
         self.stop_event.set()
+        # Unblock pause so the worker can see stop_event
+        self.pause_event.set()
+        self._is_paused = False
         self._append_log("Stop requested… (finishing current file / terminating FFmpeg)")
         self.btn_stop.config(state="disabled")
+        self.btn_pause.config(state="disabled")
 
     def _worker(self, cfg: JobConfig, base_speed: float):
-        videos = list_videos(cfg.input_dir, cfg.recurse)
-        self.msg_q.put(("total", len(videos)))
-
-        run_log = cfg.output_dir / f"_shortbot_run_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
-        try:
-            log_fp = run_log.open("w", encoding="utf-8")
-        except Exception:
-            log_fp = None
-
-        def log_event(obj: dict):
-            if log_fp:
-                log_fp.write(json.dumps(obj, ensure_ascii=False) + "\n")
-                log_fp.flush()
-
+        """
+        Main processing loop.  Supports loop mode, include/exclude folders,
+        pause/resume, random duration, and short-clips mode.
+        All core speed logic is preserved unchanged from v7.
+        """
         ffmpeg_fail_hwaccel = 0
+        loop_count = 0
 
-        for idx, src in enumerate(videos, start=1):
-            if self.stop_event.is_set():
-                break
+        while True:
+            loop_count += 1
+            if cfg.loop_mode and loop_count > 1:
+                self.msg_q.put(("log", f"── Loop iteration {loop_count} ──"))
 
-            dst = cfg.output_dir / safe_out_name(src)
-            dst_tmp = cfg.output_dir / (dst.stem + ".tmp.mp4")
+            videos = list_videos(
+                cfg.input_dir,
+                cfg.recurse,
+                include_folders=cfg.include_folders,
+            )
 
-            if dst.exists() and not cfg.overwrite:
-                self.msg_q.put(("log", f"[{idx}/{len(videos)}] SKIP exists: {dst.name}"))
-                self.msg_q.put(("done", 1))
-                continue
+            # In loop mode without overwrite: skip already-produced files
+            if cfg.loop_mode and not cfg.overwrite:
+                videos = [
+                    v for v in videos
+                    if not (cfg.output_dir / safe_out_name(v)).exists()
+                ]
+                if not videos:
+                    self.msg_q.put(("log", f"Loop: no new files found. Waiting {LOOP_EMPTY_WAIT_SEC} s before next scan…"))
+                    iterations = int(LOOP_EMPTY_WAIT_SEC / 0.1)
+                    for _ in range(iterations):
+                        if self.stop_event.is_set():
+                            break
+                        time.sleep(0.1)
+                    if self.stop_event.is_set():
+                        break
+                    continue
 
+            self.msg_q.put(("total", len(videos)))
+
+            run_log = cfg.output_dir / f"_shortbot_run_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
             try:
-                if dst_tmp.exists():
-                    dst_tmp.unlink()
+                log_fp = run_log.open("w", encoding="utf-8")
             except Exception:
-                pass
+                log_fp = None
 
-            self.msg_q.put(("log", f"[{idx}/{len(videos)}] Processing: {src.name}"))
-            self.msg_q.put(("status", f"{idx}/{len(videos)}"))
+            def log_event(obj: dict):
+                if log_fp:
+                    log_fp.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                    log_fp.flush()
 
-            src_duration = probe_duration_seconds(src)
+            for idx, src in enumerate(videos, start=1):
+                if self.stop_event.is_set():
+                    break
 
-            # If we cannot probe duration, DO NOT SKIP.
-            # Just use base speed (or 5x rule can't be applied), and render.
-            if src_duration is None:
-                initial_speed = base_speed
-                speed_for_file = initial_speed
-                trials = []
-                self.msg_q.put(("log", f"  WARN: Cannot read duration via ffprobe. Rendering anyway at {speed_for_file:.1f}x (no-skip)."))
-                log_event({
-                    "file": str(src),
-                    "status": "duration_unreadable_render_anyway",
-                    "speed": speed_for_file,
-                })
-            else:
-                # Apply rule + no-skip fallback ladder
-                initial_speed = choose_initial_speed(src_duration, base_speed)
-                speed_for_file, trials = pick_speed_no_skip(src_duration, initial_speed)
+                # ── Pause support: blocks between files, never mid-encode ──
+                if not self.pause_event.is_set():
+                    self.msg_q.put(("status", "Paused"))
+                    self.pause_event.wait()
+                    if self.stop_event.is_set():
+                        break
 
-                rule_tag = "≤10m" if src_duration <= LENGTH_THRESHOLD_SEC else ">10m"
-                self.msg_q.put(("log", f"  Rule: duration={src_duration/60:.2f} min ({rule_tag}) -> initial speed={initial_speed:.1f}x"))
+                dst = cfg.output_dir / safe_out_name(src)
+                dst_tmp = cfg.output_dir / (dst.stem + ".tmp.mp4")
 
-                if trials:
-                    # log ladder decisions
-                    # If none qualified, we still keep the last speed and render (no skip).
-                    qualifies = any(eff >= MIN_EFFECTIVE_DURATION for _, eff in trials)
-                    if qualifies:
-                        # Find first qualifying
-                        for s, eff in trials:
-                            if eff >= MIN_EFFECTIVE_DURATION:
-                                self.msg_q.put(("log", f"  Length check: {s:.1f}x gives {eff:.2f}s (>= {MIN_EFFECTIVE_DURATION:.0f}s) -> using {s:.1f}x"))
-                                break
-                    else:
-                        last_s, last_eff = trials[-1]
-                        self.msg_q.put((
-                            "log",
-                            f"  Length check: even at {last_s:.1f}x effective={last_eff:.2f}s (< {MIN_EFFECTIVE_DURATION:.0f}s). "
-                            f"Rendering anyway (no-skip) at {last_s:.1f}x."
-                        ))
+                if dst.exists() and not cfg.overwrite:
+                    self.msg_q.put(("log", f"[{idx}/{len(videos)}] SKIP exists: {dst.name}"))
+                    self.msg_q.put(("done", 1))
+                    continue
 
-            # Build command
-            try:
-                cmd = build_ffmpeg_cmd(cfg, src, dst_tmp, speed_for_file)
-            except Exception as e:
-                self.msg_q.put(("log", f"  ERROR building cmd: {e}"))
-                log_event({"file": str(src), "status": "cmd_error", "error": str(e)})
-                self.msg_q.put(("done", 1))
-                continue
-
-            started = time.time()
-            rc, prog = run_ffmpeg_with_progress(cmd, self.stop_event)
-
-            if rc != 0 and cfg.use_hwaccel:
-                ffmpeg_fail_hwaccel += 1
-                self.msg_q.put(("log", "  HWACCEL failed; retrying without -hwaccel cuda…"))
-                cfg2 = JobConfig(**{**cfg.__dict__, "use_hwaccel": False})
-                cmd2 = build_ffmpeg_cmd(cfg2, src, dst_tmp, speed_for_file)
-                rc, prog = run_ffmpeg_with_progress(cmd2, self.stop_event)
-
-            elapsed = time.time() - started
-
-            if self.stop_event.is_set():
                 try:
                     if dst_tmp.exists():
                         dst_tmp.unlink()
                 except Exception:
                     pass
-                break
 
-            if rc == 0 and dst_tmp.exists():
-                # IMPORTANT CHANGE: do NOT delete/skip if output is shorter than MIN_EFFECTIVE_DURATION.
-                # Short sources must still produce output.
-                try:
-                    if dst.exists() and cfg.overwrite:
-                        dst.unlink()
-                    dst_tmp.replace(dst)
-                    out_dur = probe_duration_seconds(dst)
-                    self.msg_q.put(("log", f"  OK -> {dst.name}  ({elapsed:.1f}s)  out_dur={out_dur:.2f}s" if out_dur is not None else f"  OK -> {dst.name}  ({elapsed:.1f}s)"))
+                self.msg_q.put(("log", f"[{idx}/{len(videos)}] Processing: {src.name}"))
+                self.msg_q.put(("status", f"{idx}/{len(videos)}"))
+
+                # ── Probe source ───────────────────────────────────────────
+                src_duration = probe_duration_seconds(src)
+                src_codec = probe_video_codec(src)
+
+                if src_codec and src_codec in HEVC_LIKE_CODECS:
+                    self.msg_q.put(("log", f"  Codec: {src_codec} — using software decode for reliability"))
+
+                # ── Random duration (normal mode only) ────────────────────
+                if cfg.random_duration and cfg.workflow_mode == "normal":
+                    target_dur = random.uniform(RANDOM_DURATION_MIN, RANDOM_DURATION_MAX)
+                    self.msg_q.put(("log", f"  Random duration: {target_dur:.1f} s"))
+                else:
+                    target_dur = cfg.out_duration
+
+                # ── Speed selection ────────────────────────────────────────
+                if src_duration is None:
+                    # Cannot probe duration — do not skip, render at base speed
+                    initial_speed = base_speed
+                    speed_for_file = initial_speed
+                    trials: List[Tuple[float, float]] = []
+                    self.msg_q.put((
+                        "log",
+                        f"  WARN: Cannot read duration via ffprobe. "
+                        f"Rendering anyway at {speed_for_file:.1f}× (no-skip).",
+                    ))
                     log_event({
                         "file": str(src),
-                        "status": "ok",
-                        "elapsed_sec": elapsed,
+                        "status": "duration_unreadable_render_anyway",
                         "speed": speed_for_file,
-                        "src_duration": src_duration,
-                        "trials": trials,
-                        "output_duration": out_dur,
-                        "progress": json.loads(prog) if prog else {},
                     })
+                else:
+                    # Apply client speed rule + no-skip fallback ladder (PRESERVED)
+                    initial_speed = choose_initial_speed(src_duration, base_speed)
+                    speed_for_file, trials = pick_speed_no_skip(
+                        src_duration, initial_speed, cfg.use_min_duration
+                    )
+
+                    rule_tag = "≤10m" if src_duration <= LENGTH_THRESHOLD_SEC else ">10m"
+                    self.msg_q.put((
+                        "log",
+                        f"  Rule: duration={src_duration / 60:.2f} min ({rule_tag})"
+                        f" → initial speed={initial_speed:.1f}×",
+                    ))
+
+                    if trials and cfg.use_min_duration:
+                        qualifies = any(eff >= MIN_EFFECTIVE_DURATION for _, eff in trials)
+                        if qualifies:
+                            for s, eff in trials:
+                                if eff >= MIN_EFFECTIVE_DURATION:
+                                    self.msg_q.put((
+                                        "log",
+                                        f"  Length check: {s:.1f}× gives {eff:.2f}s"
+                                        f" (≥ {MIN_EFFECTIVE_DURATION:.0f}s) → using {s:.1f}×",
+                                    ))
+                                    break
+                        else:
+                            last_s, last_eff = trials[-1]
+                            self.msg_q.put((
+                                "log",
+                                f"  Length check: even at {last_s:.1f}× effective={last_eff:.2f}s"
+                                f" (< {MIN_EFFECTIVE_DURATION:.0f}s). Rendering anyway (no-skip) at {last_s:.1f}×.",
+                            ))
+
+                # ── Build effective config with resolved duration ───────────
+                eff_cfg = JobConfig(**{
+                    **cfg.__dict__,
+                    "out_duration": target_dur,
+                })
+
+                # ── Build FFmpeg command ────────────────────────────────────
+                try:
+                    cmd = build_ffmpeg_cmd(eff_cfg, src, dst_tmp, speed_for_file, src_codec=src_codec)
                 except Exception as e:
-                    self.msg_q.put(("log", f"  ERROR finalizing output: {e}"))
-                    log_event({"file": str(src), "status": "finalize_error", "error": str(e), "progress": prog})
+                    self.msg_q.put(("log", f"  ERROR building cmd: {e}"))
+                    log_event({"file": str(src), "status": "cmd_error", "error": str(e)})
+                    self.msg_q.put(("done", 1))
+                    continue
+
+                started = time.time()
+                rc, prog = run_ffmpeg_with_progress(cmd, self.stop_event)
+
+                # ── HWACCEL fallback (if hwaccel was used and failed) ──────
+                if rc != 0 and eff_cfg.use_hwaccel:
+                    ffmpeg_fail_hwaccel += 1
+                    self.msg_q.put(("log", "  HWACCEL failed; retrying without -hwaccel cuda…"))
+                    cfg_sw = JobConfig(**{**eff_cfg.__dict__, "use_hwaccel": False})
+                    cmd2 = build_ffmpeg_cmd(cfg_sw, src, dst_tmp, speed_for_file, src_codec=src_codec)
+                    rc, prog = run_ffmpeg_with_progress(cmd2, self.stop_event)
+
+                elapsed = time.time() - started
+
+                if self.stop_event.is_set():
                     try:
                         if dst_tmp.exists():
                             dst_tmp.unlink()
                     except Exception:
                         pass
-            else:
-                self.msg_q.put(("log", f"  FAIL (rc={rc})  ({elapsed:.1f}s)"))
-                try:
-                    if dst_tmp.exists():
-                        dst_tmp.unlink()
-                except Exception:
-                    pass
-                log_event({"file": str(src), "status": "fail", "rc": rc, "elapsed_sec": elapsed, "speed": speed_for_file, "progress": prog})
+                    break
 
-            self.msg_q.put(("done", 1))
+                if rc == 0 and dst_tmp.exists():
+                    # IMPORTANT: do NOT skip outputs shorter than MIN_EFFECTIVE_DURATION.
+                    # Short sources must still produce an output (preserved from v7).
+                    try:
+                        if dst.exists() and cfg.overwrite:
+                            dst.unlink()
+                        dst_tmp.replace(dst)
+                        out_dur = probe_duration_seconds(dst)
+                        dur_str = f"  out_dur={out_dur:.2f}s" if out_dur is not None else ""
+                        self.msg_q.put(("log", f"  OK → {dst.name}  ({elapsed:.1f}s){dur_str}"))
+                        log_event({
+                            "file": str(src),
+                            "status": "ok",
+                            "elapsed_sec": elapsed,
+                            "speed": speed_for_file,
+                            "src_duration": src_duration,
+                            "trials": trials,
+                            "output_duration": out_dur,
+                            "progress": json.loads(prog) if prog else {},
+                        })
+                    except Exception as e:
+                        self.msg_q.put(("log", f"  ERROR finalizing output: {e}"))
+                        log_event({"file": str(src), "status": "finalize_error", "error": str(e), "progress": prog})
+                        try:
+                            if dst_tmp.exists():
+                                dst_tmp.unlink()
+                        except Exception:
+                            pass
+                else:
+                    self.msg_q.put(("log", f"  FAIL (rc={rc})  ({elapsed:.1f}s)"))
+                    try:
+                        if dst_tmp.exists():
+                            dst_tmp.unlink()
+                    except Exception:
+                        pass
+                    log_event({
+                        "file": str(src), "status": "fail", "rc": rc,
+                        "elapsed_sec": elapsed, "speed": speed_for_file, "progress": prog,
+                    })
 
-        if log_fp:
-            log_fp.close()
+                self.msg_q.put(("done", 1))
+
+            if log_fp:
+                log_fp.close()
+
+            if self.stop_event.is_set() or not cfg.loop_mode:
+                break
+
+            # Brief sleep between loop iterations (responsive to stop)
+            self.msg_q.put(("log", f"── Loop batch done. Rescanning in {LOOP_RESCAN_WAIT_SEC} s… ──"))
+            iterations = int(LOOP_RESCAN_WAIT_SEC / 0.1)
+            for _ in range(iterations):
+                if self.stop_event.is_set():
+                    break
+                time.sleep(0.1)
+            if self.stop_event.is_set():
+                break
 
         self.msg_q.put(("finished", {"hwaccel_failures": ffmpeg_fail_hwaccel}))
 
@@ -738,16 +1215,22 @@ class ShortBotApp(tk.Tk):
                     self._set_status(f"{self.done_files}/{self.total_files}")
                 elif typ == "log":
                     self._append_log(str(payload))
+                elif typ == "status":
+                    self._set_status(str(payload))
                 elif typ == "finished":
                     info = payload if isinstance(payload, dict) else {}
                     self._append_log("----")
                     self._append_log(f"Finished. Done: {self.done_files}/{self.total_files}.")
                     if info.get("hwaccel_failures"):
                         self._append_log(
-                            f"Note: {info['hwaccel_failures']} file(s) failed CUDA decode and were retried without hwaccel."
+                            f"Note: {info['hwaccel_failures']} file(s) failed CUDA decode "
+                            f"and were retried in software."
                         )
                     self.btn_start.config(state="normal")
                     self.btn_stop.config(state="disabled")
+                    self.btn_pause.config(state="disabled")
+                    self._is_paused = False
+                    self.btn_pause.config(text="⏸  Pause")
                     self._set_status("Idle")
         except queue.Empty:
             pass
