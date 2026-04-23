@@ -1,0 +1,9 @@
+pyinstaller ^
+  --onefile ^
+  --noconsole ^
+  --windowed ^
+  --name ShortBot ^
+  --icon app.ico ^
+  --add-data "app.ico;." ^
+  --add-data "app.png;." ^
+  ShortVideoProcessingBot-v5.py
