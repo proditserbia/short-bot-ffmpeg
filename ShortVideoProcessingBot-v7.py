@@ -321,6 +321,7 @@ def build_ffmpeg_cmd(
     dst_tmp: Path,
     speed: float,
     src_codec: Optional[str] = None,
+    input_trim_sec: Optional[float] = None,
 ) -> List[str]:
     """
     Build the FFmpeg command.
@@ -329,10 +330,18 @@ def build_ffmpeg_cmd(
     - src_codec: if HEVC/problematic, hwaccel is skipped automatically.
     - workflow_mode=="short_clips": the -t (duration trim) flag is omitted.
 
+    Duration logic (normal mode):
+      input_trim_sec = target_output_duration * speed   (pre-computed by caller)
+      FFmpeg trims the INPUT to input_trim_sec, THEN speed-up filters are applied,
+      so the output duration ≈ input_trim_sec / speed ≈ target_output_duration.
+
+      Passing the target output duration directly as -t would trim the input to
+      target seconds BEFORE speed-up, yielding only target/speed seconds of output
+      (e.g. 60 s / 4× = 15 s instead of 60 s).
+
     FFmpeg graph:
-      video: setpts=PTS/speed
+      video: setpts=(PTS-STARTPTS)/speed
       audio: atempo chain to support >2.0 speed (0.5..2.0 each)
-    Cut: -t cfg.out_duration (after speed-up) — skipped in short_clips mode.
     """
     ffmpeg = which_ffmpeg()
 
@@ -381,9 +390,12 @@ def build_ffmpeg_cmd(
 
     cmd += ["-i", str(src)]
 
-    # Short-clips mode: no forced duration trim
-    if cfg.workflow_mode != "short_clips":
-        cmd += ["-t", f"{cfg.out_duration:.3f}"]
+    # Trim the INPUT to input_trim_sec before speed-up filters are applied.
+    # input_trim_sec = target_output_duration * speed, so after speed-up the
+    # output will be approximately target_output_duration seconds.
+    # None means no trim (short_clips mode).
+    if input_trim_sec is not None:
+        cmd += ["-t", f"{input_trim_sec:.3f}"]
 
     cmd += [
         "-map", "0:v:0?",
@@ -1156,9 +1168,25 @@ class ShortBotApp(tk.Tk):
                     "out_duration": target_dur,
                 })
 
+                # ── Compute input trim duration ────────────────────────────
+                # In normal mode: trim the INPUT to (target_dur * speed) so that
+                # after the speed-up filter the output is ≈ target_dur seconds.
+                # In short_clips mode: no trim — process the full source.
+                if cfg.workflow_mode == "normal":
+                    input_trim_sec: Optional[float] = target_dur * speed_for_file
+                    if src_duration is not None:
+                        input_trim_sec = min(src_duration, input_trim_sec)
+                    self.msg_q.put(("log",
+                        f"  Target output: {target_dur:.2f}s  "
+                        f"Input trim: {input_trim_sec:.2f}s  "
+                        f"Speed: {speed_for_file:.1f}×"
+                    ))
+                else:
+                    input_trim_sec = None  # short_clips: no trim
+
                 # ── Build FFmpeg command ────────────────────────────────────
                 try:
-                    cmd = build_ffmpeg_cmd(eff_cfg, src, dst_tmp, speed_for_file, src_codec=src_codec)
+                    cmd = build_ffmpeg_cmd(eff_cfg, src, dst_tmp, speed_for_file, src_codec=src_codec, input_trim_sec=input_trim_sec)
                 except Exception as e:
                     self.msg_q.put(("log", f"  ERROR building cmd: {e}"))
                     log_event({"file": str(src), "status": "cmd_error", "error": str(e)})
@@ -1180,7 +1208,7 @@ class ShortBotApp(tk.Tk):
                     except Exception:
                         pass
                     cfg_sw = JobConfig(**{**eff_cfg.__dict__, "use_hwaccel": False})
-                    cmd2 = build_ffmpeg_cmd(cfg_sw, src, dst_tmp, speed_for_file, src_codec=src_codec)
+                    cmd2 = build_ffmpeg_cmd(cfg_sw, src, dst_tmp, speed_for_file, src_codec=src_codec, input_trim_sec=input_trim_sec)
                     rc, prog = run_ffmpeg_with_progress(cmd2, self.stop_event)
 
                 elapsed = time.time() - started
@@ -1206,11 +1234,16 @@ class ShortBotApp(tk.Tk):
                         out_dur = probe_duration_seconds(dst)
 
                         # ── Validate output duration ───────────────────────
-                        # Compute the maximum sensible output we could get:
-                        # whichever is smaller — the requested target or the
-                        # full source played at the chosen speed.
-                        if src_duration is not None:
-                            expected_out = min(target_dur, src_duration / speed_for_file)
+                        # expected_out: what duration we expect the output to be.
+                        # In normal mode: input_trim_sec (already clamped to
+                        # src_duration) divided by speed gives the expected output.
+                        # In short_clips mode: full source divided by speed.
+                        if input_trim_sec is not None:
+                            # normal mode: input was trimmed to input_trim_sec
+                            expected_out = input_trim_sec / speed_for_file
+                        elif src_duration is not None:
+                            # short_clips with known source
+                            expected_out = src_duration / speed_for_file
                         else:
                             expected_out = target_dur
 
@@ -1230,8 +1263,8 @@ class ShortBotApp(tk.Tk):
                         if duration_ok:
                             if out_dur is not None:
                                 dur_str = (
-                                    f"  expected={expected_out:.2f}s "
-                                    f" actual={out_dur:.2f}s"
+                                    f"  expected={expected_out:.2f}s"
+                                    f"  actual={out_dur:.2f}s"
                                 )
                             else:
                                 dur_str = f"  expected={expected_out:.2f}s"
@@ -1242,6 +1275,7 @@ class ShortBotApp(tk.Tk):
                                 "elapsed_sec": elapsed,
                                 "speed": speed_for_file,
                                 "src_duration": src_duration,
+                                "input_trim_sec": input_trim_sec,
                                 "expected_output_duration": expected_out,
                                 "trials": trials,
                                 "output_duration": out_dur,
@@ -1266,6 +1300,7 @@ class ShortBotApp(tk.Tk):
                                 "elapsed_sec": elapsed,
                                 "speed": speed_for_file,
                                 "src_duration": src_duration,
+                                "input_trim_sec": input_trim_sec,
                                 "expected_output_duration": expected_out,
                                 "output_duration": out_dur,
                                 "expected_min": min_acceptable,
