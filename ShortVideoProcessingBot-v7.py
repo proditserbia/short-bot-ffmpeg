@@ -183,7 +183,35 @@ def safe_out_name(src: Path) -> str:
 
 
 def probe_duration_seconds(path: Path) -> Optional[float]:
-    """Returns duration in seconds using ffprobe, or None if ffprobe fails."""
+    """Returns duration in seconds using ffprobe, or None if ffprobe fails.
+
+    Reads the video stream duration first (more accurate for output validation:
+    the container/format duration can be inflated by -t even when FFmpeg only
+    encoded a few seconds of frames).  Falls back to format-level duration if
+    the stream duration is unavailable (e.g. audio-only files).
+    """
+    # Primary: video stream duration — reflects actual encoded frames
+    try:
+        cmd = [
+            which_ffprobe(),
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=duration",
+            "-of", "default=nw=1:nk=1",
+            str(path),
+        ]
+        out = subprocess.check_output(
+            cmd,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            **_subprocess_no_window_kwargs()
+        ).strip()
+        if out and out != "N/A":
+            return float(out)
+    except Exception:
+        pass
+
+    # Fallback: format/container duration
     try:
         cmd = [
             which_ffprobe(),
@@ -342,7 +370,14 @@ def build_ffmpeg_cmd(
     ]
 
     if use_hw:
-        cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        # Use -hwaccel cuda for hardware decode but do NOT add
+        # -hwaccel_output_format cuda.  Keeping decoded frames in GPU memory
+        # (AV_PIX_FMT_CUDA) prevents software filters like setpts from working
+        # correctly and produces extremely short outputs (3–15 s instead of the
+        # expected ~60 s).  Without -hwaccel_output_format, frames are downloaded
+        # to CPU after hardware decode so all software filters work normally, and
+        # h264_nvenc / hevc_nvenc still accept CPU frames for encoding.
+        cmd += ["-hwaccel", "cuda"]
 
     cmd += ["-i", str(src)]
 
@@ -1171,27 +1206,35 @@ class ShortBotApp(tk.Tk):
                         out_dur = probe_duration_seconds(dst)
 
                         # ── Validate output duration ───────────────────────
-                        # In normal mode we expect the output to be close to
-                        # target_dur (or src_duration/speed if that is shorter).
-                        # If the actual duration is suspiciously short we treat
-                        # the result as a failure so a broken file is never
-                        # silently accepted.
+                        # Compute the maximum sensible output we could get:
+                        # whichever is smaller — the requested target or the
+                        # full source played at the chosen speed.
+                        if src_duration is not None:
+                            expected_out = min(target_dur, src_duration / speed_for_file)
+                        else:
+                            expected_out = target_dur
+
+                        # In normal mode, require at least OUTPUT_DURATION_MIN_RATIO
+                        # of expected_out (with an absolute floor).  This catches
+                        # broken outputs (e.g. 4 s instead of ~60 s) that FFmpeg
+                        # can silently produce when the filter chain misbehaves.
                         duration_ok = True
+                        min_acceptable = max(
+                            expected_out * OUTPUT_DURATION_MIN_RATIO,
+                            OUTPUT_DURATION_FLOOR_SEC,
+                        )
                         if cfg.workflow_mode == "normal" and out_dur is not None:
-                            # Compute the maximum sensible output we could get
-                            if src_duration is not None:
-                                expected_out = min(target_dur, src_duration / speed_for_file)
-                            else:
-                                expected_out = target_dur
-                            # Require at least OUTPUT_DURATION_MIN_RATIO of the expected
-                            # output duration (with an absolute floor)
-                            min_acceptable = max(expected_out * OUTPUT_DURATION_MIN_RATIO,
-                                                 OUTPUT_DURATION_FLOOR_SEC)
                             if out_dur < min_acceptable:
                                 duration_ok = False
 
                         if duration_ok:
-                            dur_str = f"  out_dur={out_dur:.2f}s" if out_dur is not None else ""
+                            if out_dur is not None:
+                                dur_str = (
+                                    f"  expected={expected_out:.2f}s "
+                                    f" actual={out_dur:.2f}s"
+                                )
+                            else:
+                                dur_str = f"  expected={expected_out:.2f}s"
                             self.msg_q.put(("log", f"  OK → {dst.name}  ({elapsed:.1f}s){dur_str}"))
                             log_event({
                                 "file": str(src),
@@ -1199,6 +1242,7 @@ class ShortBotApp(tk.Tk):
                                 "elapsed_sec": elapsed,
                                 "speed": speed_for_file,
                                 "src_duration": src_duration,
+                                "expected_output_duration": expected_out,
                                 "trials": trials,
                                 "output_duration": out_dur,
                                 "progress": json.loads(prog) if prog else {},
@@ -1207,8 +1251,8 @@ class ShortBotApp(tk.Tk):
                             # Output is too short — broken file, remove it
                             fail_msg = (
                                 f"  FAIL: output too short "
-                                f"({out_dur:.2f}s measured, "
-                                f"expected ≥{min_acceptable:.1f}s)  ({elapsed:.1f}s)"
+                                f"(actual={out_dur:.2f}s, "
+                                f"expected≥{min_acceptable:.1f}s)  ({elapsed:.1f}s)"
                             )
                             self.msg_q.put(("log", fail_msg))
                             try:
@@ -1222,6 +1266,7 @@ class ShortBotApp(tk.Tk):
                                 "elapsed_sec": elapsed,
                                 "speed": speed_for_file,
                                 "src_duration": src_duration,
+                                "expected_output_duration": expected_out,
                                 "output_duration": out_dur,
                                 "expected_min": min_acceptable,
                                 "progress": json.loads(prog) if prog else {},
