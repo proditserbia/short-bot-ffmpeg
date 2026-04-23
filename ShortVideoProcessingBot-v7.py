@@ -67,6 +67,16 @@ CONFIG_FILE = Path(__file__).with_suffix(".json")
 LOOP_RESCAN_WAIT_SEC = 5    # wait between loop iterations
 LOOP_EMPTY_WAIT_SEC = 10    # wait when no new files are found (overwrite=OFF)
 
+# Output duration validation (normal mode only).
+# After encoding we measure the real file duration with ffprobe and compare it
+# to the expected output.  If the actual duration is below this fraction of the
+# expected duration we consider the file broken and delete it.  70 % allows a
+# small encoding variance while still catching obviously wrong files (e.g. 4 s
+# instead of ~60 s).  The floor of 5 s ensures a minimum sensible output even
+# for very short target durations.
+OUTPUT_DURATION_MIN_RATIO = 0.70   # fraction of expected output duration
+OUTPUT_DURATION_FLOOR_SEC = 5.0    # absolute minimum acceptable output (seconds)
+
 
 def _subprocess_no_window_kwargs() -> dict:
     if os.name != "nt":
@@ -310,8 +320,11 @@ def build_ffmpeg_cmd(
         remaining /= 2.0
     atempo_filters.append(f"atempo={remaining:.6f}".rstrip("0").rstrip("."))
 
-    # video speed-up
-    v_filter = f"setpts=PTS/{speed:.6f}".rstrip("0").rstrip(".")
+    # video speed-up: (PTS-STARTPTS) normalises start timestamp to 0 so that
+    # sources with non-zero initial PTS (e.g. MPEG-TS, broadcast files) are
+    # handled correctly and the output -t trim lands at the right point.
+    speed_str = f"{speed:.6f}".rstrip("0").rstrip(".")
+    v_filter = f"setpts=(PTS-STARTPTS)/{speed_str}"
     if cfg.out_fps:
         v_filter = f"{v_filter},fps={int(cfg.out_fps)}"
 
@@ -1124,6 +1137,13 @@ class ShortBotApp(tk.Tk):
                 if rc != 0 and eff_cfg.use_hwaccel:
                     ffmpeg_fail_hwaccel += 1
                     self.msg_q.put(("log", "  HWACCEL failed; retrying without -hwaccel cuda…"))
+                    # Remove any partial file left by the failed HWACCEL run so
+                    # the software-decode retry always starts with a clean slate.
+                    try:
+                        if dst_tmp.exists():
+                            dst_tmp.unlink()
+                    except Exception:
+                        pass
                     cfg_sw = JobConfig(**{**eff_cfg.__dict__, "use_hwaccel": False})
                     cmd2 = build_ffmpeg_cmd(cfg_sw, src, dst_tmp, speed_for_file, src_codec=src_codec)
                     rc, prog = run_ffmpeg_with_progress(cmd2, self.stop_event)
@@ -1145,19 +1165,68 @@ class ShortBotApp(tk.Tk):
                         if dst.exists() and cfg.overwrite:
                             dst.unlink()
                         dst_tmp.replace(dst)
+
+                        # Always measure the REAL output duration via ffprobe so that
+                        # the log reflects actual content, not the requested -t value.
                         out_dur = probe_duration_seconds(dst)
-                        dur_str = f"  out_dur={out_dur:.2f}s" if out_dur is not None else ""
-                        self.msg_q.put(("log", f"  OK → {dst.name}  ({elapsed:.1f}s){dur_str}"))
-                        log_event({
-                            "file": str(src),
-                            "status": "ok",
-                            "elapsed_sec": elapsed,
-                            "speed": speed_for_file,
-                            "src_duration": src_duration,
-                            "trials": trials,
-                            "output_duration": out_dur,
-                            "progress": json.loads(prog) if prog else {},
-                        })
+
+                        # ── Validate output duration ───────────────────────
+                        # In normal mode we expect the output to be close to
+                        # target_dur (or src_duration/speed if that is shorter).
+                        # If the actual duration is suspiciously short we treat
+                        # the result as a failure so a broken file is never
+                        # silently accepted.
+                        duration_ok = True
+                        if cfg.workflow_mode == "normal" and out_dur is not None:
+                            # Compute the maximum sensible output we could get
+                            if src_duration is not None:
+                                expected_out = min(target_dur, src_duration / speed_for_file)
+                            else:
+                                expected_out = target_dur
+                            # Require at least OUTPUT_DURATION_MIN_RATIO of the expected
+                            # output duration (with an absolute floor)
+                            min_acceptable = max(expected_out * OUTPUT_DURATION_MIN_RATIO,
+                                                 OUTPUT_DURATION_FLOOR_SEC)
+                            if out_dur < min_acceptable:
+                                duration_ok = False
+
+                        if duration_ok:
+                            dur_str = f"  out_dur={out_dur:.2f}s" if out_dur is not None else ""
+                            self.msg_q.put(("log", f"  OK → {dst.name}  ({elapsed:.1f}s){dur_str}"))
+                            log_event({
+                                "file": str(src),
+                                "status": "ok",
+                                "elapsed_sec": elapsed,
+                                "speed": speed_for_file,
+                                "src_duration": src_duration,
+                                "trials": trials,
+                                "output_duration": out_dur,
+                                "progress": json.loads(prog) if prog else {},
+                            })
+                        else:
+                            # Output is too short — broken file, remove it
+                            fail_msg = (
+                                f"  FAIL: output too short "
+                                f"({out_dur:.2f}s measured, "
+                                f"expected ≥{min_acceptable:.1f}s)  ({elapsed:.1f}s)"
+                            )
+                            self.msg_q.put(("log", fail_msg))
+                            try:
+                                if dst.exists():
+                                    dst.unlink()
+                            except Exception:
+                                pass
+                            log_event({
+                                "file": str(src),
+                                "status": "fail_short_output",
+                                "elapsed_sec": elapsed,
+                                "speed": speed_for_file,
+                                "src_duration": src_duration,
+                                "output_duration": out_dur,
+                                "expected_min": min_acceptable,
+                                "progress": json.loads(prog) if prog else {},
+                            })
+
                     except Exception as e:
                         self.msg_q.put(("log", f"  ERROR finalizing output: {e}"))
                         log_event({"file": str(src), "status": "finalize_error", "error": str(e), "progress": prog})
