@@ -6,4 +6,4 @@ pyinstaller ^
   --icon app.ico ^
   --add-data "app.ico;." ^
   --add-data "app.png;." ^
-  ShortVideoProcessingBot-v5.py
+  ShortVideoProcessingBot-v7.py
