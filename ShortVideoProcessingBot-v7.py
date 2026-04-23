@@ -63,6 +63,10 @@ HEVC_LIKE_CODECS = {"hevc", "h265", "vp9", "av1", "vc1"}
 # Config persistence file (sits next to the script)
 CONFIG_FILE = Path(__file__).with_suffix(".json")
 
+# Loop mode: wait periods between scans (in 0.1-second increments for stop responsiveness)
+LOOP_RESCAN_WAIT_SEC = 5    # wait between loop iterations
+LOOP_EMPTY_WAIT_SEC = 10    # wait when no new files are found (overwrite=OFF)
+
 
 def _subprocess_no_window_kwargs() -> dict:
     if os.name != "nt":
@@ -984,8 +988,9 @@ class ShortBotApp(tk.Tk):
                     if not (cfg.output_dir / safe_out_name(v)).exists()
                 ]
                 if not videos:
-                    self.msg_q.put(("log", "Loop: no new files found. Waiting 10 s before next scan…"))
-                    for _ in range(100):
+                    self.msg_q.put(("log", f"Loop: no new files found. Waiting {LOOP_EMPTY_WAIT_SEC} s before next scan…"))
+                    iterations = int(LOOP_EMPTY_WAIT_SEC / 0.1)
+                    for _ in range(iterations):
                         if self.stop_event.is_set():
                             break
                         time.sleep(0.1)
@@ -1182,8 +1187,9 @@ class ShortBotApp(tk.Tk):
                 break
 
             # Brief sleep between loop iterations (responsive to stop)
-            self.msg_q.put(("log", "── Loop batch done. Rescanning in 5 s… ──"))
-            for _ in range(50):
+            self.msg_q.put(("log", f"── Loop batch done. Rescanning in {LOOP_RESCAN_WAIT_SEC} s… ──"))
+            iterations = int(LOOP_RESCAN_WAIT_SEC / 0.1)
+            for _ in range(iterations):
                 if self.stop_event.is_set():
                     break
                 time.sleep(0.1)
