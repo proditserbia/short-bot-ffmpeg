@@ -109,6 +109,7 @@ class JobConfig:
     workflow_mode: str = "normal"        # "normal" | "short_clips"
     loop_mode: bool = False              # continuously re-process folders
     include_folders: Optional[List[str]] = None  # None = all subfolders
+    exclude_folders: Optional[List[str]] = None  # None = no exclusions
 
 
 def which_ffmpeg() -> str:
@@ -141,13 +142,17 @@ def list_videos(
     root: Path,
     recurse: bool,
     include_folders: Optional[List[str]] = None,
+    exclude_folders: Optional[List[str]] = None,
 ) -> List[Path]:
     """
     List video files under root.
     include_folders: if set, only recurse into those immediate subfolders of root.
-                     Files directly in root are included regardless.
+                     Files directly in root are always included.
+    exclude_folders: if set, skip those immediate subfolders of root.
+                     Include is applied first, then exclude.
     """
-    inc: Optional[set] = set(include_folders) if include_folders is not None else None
+    inc: Optional[set] = set(include_folders) if include_folders else None
+    exc: Optional[set] = set(exclude_folders) if exclude_folders else None
 
     if recurse:
         files: List[Path] = []
@@ -155,9 +160,13 @@ def list_videos(
             if not is_video_file(p):
                 continue
             rel_parts = p.relative_to(root).parts
-            if len(rel_parts) > 1 and inc is not None:
-                # File is inside a subfolder — check if that top-level folder is selected
-                if rel_parts[0] not in inc:
+            if len(rel_parts) > 1:
+                top = rel_parts[0]
+                # Include filter: skip subfolder not in include list
+                if inc is not None and top not in inc:
+                    continue
+                # Exclude filter: skip subfolder in exclude list
+                if exc is not None and top in exc:
                     continue
             files.append(p)
     else:
@@ -555,22 +564,24 @@ def save_config(data: dict) -> None:
         pass
 
 
-# ─── Folder Selection Dialog ───────────────────────────────────────────────────
+# ─── Subfolder Picker Dialog ───────────────────────────────────────────────────
 
-class FolderSelectDialog(tk.Toplevel):
+class SubfolderPickerDialog(tk.Toplevel):
     """
-    Modal dialog listing all immediate subfolders of input_dir as checkboxes.
-    result is a list of selected folder names, or None if cancelled.
+    Modal dialog listing immediate subfolders of root_dir as a multi-select
+    Listbox.  Ctrl+Click / Shift+Click for multiple selection are supported
+    natively via selectmode=EXTENDED.
+    result: list of selected folder names, or None if cancelled.
     """
 
     def __init__(
         self,
         parent: tk.Tk,
         root_dir: Path,
-        current_selection: Optional[List[str]],
+        title: str = "Select Folders",
     ):
         super().__init__(parent)
-        self.title("Select Folders to Process")
+        self.title(title)
         self.resizable(True, True)
         self.grab_set()
         self.result: Optional[List[str]] = None
@@ -579,7 +590,7 @@ class FolderSelectDialog(tk.Toplevel):
         if not subfolders:
             tk.Label(
                 self,
-                text="No subfolders found. Root-level files will be processed.",
+                text="No subfolders found in the selected input folder.",
                 padx=20, pady=14,
             ).pack()
             ttk.Button(self, text="Close", command=self.destroy).pack(pady=6)
@@ -587,50 +598,43 @@ class FolderSelectDialog(tk.Toplevel):
 
         tk.Label(
             self,
-            text="Check the folders you want to process (uncheck to skip):",
+            text="Select folders  (Ctrl+Click or Shift+Click for multiple):",
             padx=10, pady=6,
         ).pack(anchor="w")
 
-        # Scrollable checkbox list
-        container = ttk.Frame(self)
-        container.pack(fill="both", expand=True, padx=10)
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
 
-        canvas = tk.Canvas(container, width=420, height=300)
-        sb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
-        inner = ttk.Frame(canvas)
-        inner.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        sb = ttk.Scrollbar(frame, orient="vertical")
+        self._lb = tk.Listbox(
+            frame,
+            selectmode=tk.EXTENDED,
+            height=15,
+            width=52,
+            yscrollcommand=sb.set,
         )
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=sb.set)
-        canvas.pack(side="left", fill="both", expand=True)
+        sb.config(command=self._lb.yview)
+        self._lb.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
-        sel_set = set(current_selection) if current_selection is not None else set(subfolders)
-        self._vars: dict = {}
         for name in subfolders:
-            var = tk.BooleanVar(value=(name in sel_set))
-            self._vars[name] = var
-            ttk.Checkbutton(inner, text=name, variable=var).pack(anchor="w", padx=4, pady=1)
+            self._lb.insert("end", name)
 
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill="x", padx=10, pady=8)
         ttk.Button(btn_frame, text="Select All", command=self._select_all).pack(side="left")
         ttk.Button(btn_frame, text="Deselect All", command=self._deselect_all).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="OK", command=self._ok).pack(side="right")
+        ttk.Button(btn_frame, text="Add Selected", command=self._ok).pack(side="right")
         ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side="right", padx=4)
 
     def _select_all(self):
-        for v in self._vars.values():
-            v.set(True)
+        self._lb.select_set(0, "end")
 
     def _deselect_all(self):
-        for v in self._vars.values():
-            v.set(False)
+        self._lb.selection_clear(0, "end")
 
     def _ok(self):
-        self.result = [name for name, var in self._vars.items() if var.get()]
+        self.result = [self._lb.get(i) for i in self._lb.curselection()]
         self.destroy()
 
 
@@ -683,13 +687,19 @@ class ShortBotApp(tk.Tk):
         self.workflow_mode = tk.StringVar(value=saved.get("workflow_mode", "normal"))
         self.loop_mode = tk.BooleanVar(value=saved.get("loop_mode", False))
 
-        # Include folder filter: list of subfolder names, or None = process all
-        self._include_folders: Optional[List[str]] = saved.get("include_folders", None)
+        # Include / Exclude folder paths (full paths, loaded then synced to listboxes)
+        self._init_include_paths: List[str] = saved.get("include_paths") if saved.get("include_paths") is not None else []
+        self._init_exclude_paths: List[str] = saved.get("exclude_paths") if saved.get("exclude_paths") is not None else []
 
         self.total_files = 0
         self.done_files = 0
 
         self._build_ui()
+        # Populate folder lists from saved config (listboxes created inside _build_ui)
+        for p in self._init_include_paths:
+            self._inc_listbox.insert("end", p)
+        for p in self._init_exclude_paths:
+            self._exc_listbox.insert("end", p)
         self._apply_workflow_mode()  # set initial widget enable/disable states
         self._tick()
 
@@ -710,7 +720,8 @@ class ShortBotApp(tk.Tk):
             "use_min_duration": self.use_min_duration.get(),
             "workflow_mode": self.workflow_mode.get(),
             "loop_mode": self.loop_mode.get(),
-            "include_folders": self._include_folders,
+            "include_paths": list(self._inc_listbox.get(0, "end")),
+            "exclude_paths": list(self._exc_listbox.get(0, "end")),
         })
 
     def _build_ui(self):
@@ -723,7 +734,6 @@ class ShortBotApp(tk.Tk):
         ttk.Label(top, text="Input folder:").grid(row=0, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.input_dir, width=62).grid(row=0, column=1, sticky="we", padx=6)
         ttk.Button(top, text="Browse…", command=self._browse_input).grid(row=0, column=2)
-        ttk.Button(top, text="Select Folders…", command=self._open_folder_select).grid(row=0, column=3, padx=4)
 
         ttk.Label(top, text="Output folder:").grid(row=1, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.output_dir, width=62).grid(row=1, column=1, sticky="we", padx=6)
@@ -817,9 +827,46 @@ class ShortBotApp(tk.Tk):
             po, text="Loop mode (re-scan and process continuously)", variable=self.loop_mode,
         ).grid(row=1, column=0, sticky="w", padx=8, pady=2)
 
-        self._lbl_folders = ttk.Label(po, text="", foreground="gray")
-        self._lbl_folders.grid(row=1, column=1, sticky="w", padx=16)
-        self._update_folder_label()
+        # ── Include / Exclude Folders ─────────────────────────────────────────
+        ie_frame = ttk.LabelFrame(self, text="Include / Exclude Folders")
+        ie_frame.pack(fill="x", **pad)
+
+        # --- Include panel ---
+        inc_panel = ttk.LabelFrame(ie_frame, text="Include only (empty = all subfolders)")
+        inc_panel.grid(row=0, column=0, padx=6, pady=4, sticky="nsew")
+
+        self._inc_listbox = tk.Listbox(inc_panel, height=4, selectmode=tk.EXTENDED, width=38)
+        inc_sb = ttk.Scrollbar(inc_panel, orient="vertical", command=self._inc_listbox.yview)
+        self._inc_listbox.configure(yscrollcommand=inc_sb.set)
+        self._inc_listbox.grid(row=0, column=0, rowspan=3, sticky="nsew", padx=(4, 0), pady=4)
+        inc_sb.grid(row=0, column=1, rowspan=3, sticky="ns", pady=4)
+        ttk.Button(inc_panel, text="Browse…", command=self._browse_include).grid(
+            row=0, column=2, padx=6, pady=2, sticky="ew")
+        ttk.Button(inc_panel, text="Remove", command=self._remove_include).grid(
+            row=1, column=2, padx=6, pady=2, sticky="ew")
+        ttk.Button(inc_panel, text="Clear", command=self._clear_include).grid(
+            row=2, column=2, padx=6, pady=2, sticky="ew")
+        inc_panel.columnconfigure(0, weight=1)
+
+        # --- Exclude panel ---
+        exc_panel = ttk.LabelFrame(ie_frame, text="Exclude these folders (empty = none)")
+        exc_panel.grid(row=0, column=1, padx=6, pady=4, sticky="nsew")
+
+        self._exc_listbox = tk.Listbox(exc_panel, height=4, selectmode=tk.EXTENDED, width=38)
+        exc_sb = ttk.Scrollbar(exc_panel, orient="vertical", command=self._exc_listbox.yview)
+        self._exc_listbox.configure(yscrollcommand=exc_sb.set)
+        self._exc_listbox.grid(row=0, column=0, rowspan=3, sticky="nsew", padx=(4, 0), pady=4)
+        exc_sb.grid(row=0, column=1, rowspan=3, sticky="ns", pady=4)
+        ttk.Button(exc_panel, text="Browse…", command=self._browse_exclude).grid(
+            row=0, column=2, padx=6, pady=2, sticky="ew")
+        ttk.Button(exc_panel, text="Remove", command=self._remove_exclude).grid(
+            row=1, column=2, padx=6, pady=2, sticky="ew")
+        ttk.Button(exc_panel, text="Clear", command=self._clear_exclude).grid(
+            row=2, column=2, padx=6, pady=2, sticky="ew")
+        exc_panel.columnconfigure(0, weight=1)
+
+        ie_frame.columnconfigure(0, weight=1)
+        ie_frame.columnconfigure(1, weight=1)
 
         # ── Controls ──────────────────────────────────────────────────────────
         ctrl = ttk.Frame(self)
@@ -867,16 +914,6 @@ class ShortBotApp(tk.Tk):
             else:
                 self._spin_duration.config(state="normal")
 
-    def _update_folder_label(self):
-        if self._include_folders is None:
-            self._lbl_folders.config(text="Folders: all subfolders", foreground="gray")
-        else:
-            n = len(self._include_folders)
-            if n == 0:
-                self._lbl_folders.config(text="Folders: none selected — root files only", foreground="orange")
-            else:
-                self._lbl_folders.config(text=f"Folders: {n} selected", foreground="black")
-
     def _browse_input(self):
         d = filedialog.askdirectory(title="Select input folder")
         if d:
@@ -884,30 +921,56 @@ class ShortBotApp(tk.Tk):
             # Auto-suggest output folder on first selection
             if not self.output_dir.get():
                 self.output_dir.set(str(Path(d) / "_SHORTS_OUT"))
-            # Reset folder filter when input changes
-            self._include_folders = None
-            self._update_folder_label()
+            # Clear folder filters when input changes
+            self._inc_listbox.delete(0, "end")
+            self._exc_listbox.delete(0, "end")
 
     def _browse_output(self):
         d = filedialog.askdirectory(title="Select output folder")
         if d:
             self.output_dir.set(d)
 
-    def _open_folder_select(self):
+    def _browse_include(self):
         in_dir = Path(self.input_dir.get().strip() or "")
         if not in_dir.exists() or not in_dir.is_dir():
             messagebox.showerror("Error", "Please select a valid input folder first.")
             return
-        dlg = FolderSelectDialog(self, in_dir, self._include_folders)
+        dlg = SubfolderPickerDialog(self, in_dir, "Select Folders to Include")
         self.wait_window(dlg)
-        if dlg.result is not None:
-            # If the user selected every subfolder, treat as "process all"
-            all_subs = set(get_immediate_subfolders(in_dir))
-            if all_subs and set(dlg.result) == all_subs:
-                self._include_folders = None
-            else:
-                self._include_folders = dlg.result
-            self._update_folder_label()
+        if dlg.result:
+            existing = set(self._inc_listbox.get(0, "end"))
+            for name in dlg.result:
+                full_path = str(in_dir / name)
+                if full_path not in existing:
+                    self._inc_listbox.insert("end", full_path)
+
+    def _remove_include(self):
+        for i in reversed(self._inc_listbox.curselection()):
+            self._inc_listbox.delete(i)
+
+    def _clear_include(self):
+        self._inc_listbox.delete(0, "end")
+
+    def _browse_exclude(self):
+        in_dir = Path(self.input_dir.get().strip() or "")
+        if not in_dir.exists() or not in_dir.is_dir():
+            messagebox.showerror("Error", "Please select a valid input folder first.")
+            return
+        dlg = SubfolderPickerDialog(self, in_dir, "Select Folders to Exclude")
+        self.wait_window(dlg)
+        if dlg.result:
+            existing = set(self._exc_listbox.get(0, "end"))
+            for name in dlg.result:
+                full_path = str(in_dir / name)
+                if full_path not in existing:
+                    self._exc_listbox.insert("end", full_path)
+
+    def _remove_exclude(self):
+        for i in reversed(self._exc_listbox.curselection()):
+            self._exc_listbox.delete(i)
+
+    def _clear_exclude(self):
+        self._exc_listbox.delete(0, "end")
 
     def _append_log(self, s: str):
         self.log.insert("end", s + "\n")
@@ -968,6 +1031,18 @@ class ShortBotApp(tk.Tk):
         use_rand_dur = self.random_duration.get() and mode == "normal"
         use_min_dur = self.use_min_duration.get() and mode != "short_clips"
 
+        # Convert stored full paths to folder names relative to in_dir
+        def _path_to_name(p_str: str) -> str:
+            try:
+                return Path(p_str).relative_to(in_dir).parts[0]
+            except (ValueError, IndexError):
+                return Path(p_str).name
+
+        inc_paths = list(self._inc_listbox.get(0, "end"))
+        exc_paths = list(self._exc_listbox.get(0, "end"))
+        include_names = [_path_to_name(p) for p in inc_paths] if inc_paths else None
+        exclude_names = [_path_to_name(p) for p in exc_paths] if exc_paths else None
+
         cfg = JobConfig(
             input_dir=in_dir,
             output_dir=out_dir,
@@ -983,7 +1058,8 @@ class ShortBotApp(tk.Tk):
             use_min_duration=use_min_dur,
             workflow_mode=mode,
             loop_mode=bool(self.loop_mode.get()),
-            include_folders=self._include_folders,
+            include_folders=include_names,
+            exclude_folders=exclude_names,
         )
 
         self.stop_event.clear()
@@ -1005,6 +1081,10 @@ class ShortBotApp(tk.Tk):
             f"min_dur={cfg.use_min_duration}  loop={cfg.loop_mode}  "
             f"hwaccel={cfg.use_hwaccel}  overwrite={cfg.overwrite}"
         )
+        if include_names:
+            self._append_log(f"Include folders selected: {len(include_names)} — {', '.join(include_names)}")
+        if exclude_names:
+            self._append_log(f"Exclude folders selected: {len(exclude_names)} — {', '.join(exclude_names)}")
         self._append_log("----")
 
         self._save_config()
@@ -1039,7 +1119,14 @@ class ShortBotApp(tk.Tk):
                 cfg.input_dir,
                 cfg.recurse,
                 include_folders=cfg.include_folders,
+                exclude_folders=cfg.exclude_folders,
             )
+
+            if cfg.include_folders:
+                self.msg_q.put(("log", f"Include folders: {len(cfg.include_folders)} — {', '.join(cfg.include_folders)}"))
+            if cfg.exclude_folders:
+                self.msg_q.put(("log", f"Exclude folders: {len(cfg.exclude_folders)} — {', '.join(cfg.exclude_folders)}"))
+            self.msg_q.put(("log", f"Final folders to process: {len(videos)} video(s) found"))
 
             # In loop mode without overwrite: skip already-produced files
             if cfg.loop_mode and not cfg.overwrite:
